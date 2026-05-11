@@ -9,7 +9,8 @@
 //
 // Phase 4.1+ : eager attention, full F32 compute, no KV cache. The
 // graph is built from scratch at every call ; a generation loop will
-// later wrap this with a sliding KV cache.
+// later wrap this with a plain causal KV cache (the talker Python
+// reference uses pure causal attention, no sliding window).
 //
 // Optional dump_dir captures bisect-layer activations and the final
 // logits in the same f32 binary format the Python reference produces,

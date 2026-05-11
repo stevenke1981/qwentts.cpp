@@ -57,11 +57,14 @@ static void qwen_encoder_downsample_free(QwenEncoderDownsample * d) {
     }
 }
 
-// Forward: causal Conv1d k=4 stride=2, no bias.
+// Forward: causal Conv1d k=4 stride=2, no bias. The Mimi downsample is
+// the only conv on this side that ships with pad_mode="replicate"
+// hardcoded upstream (transformers MimiModel.__init__), unlike SEANet
+// and the encoder transformer which inherit config.pad_mode='constant'.
 //   x: [T, 512] f32 T-first
 // Returns [ceil(T/2), 512] f32 T-first.
 static struct ggml_tensor * qwen_encoder_downsample_forward(struct ggml_context *         ctx,
                                                             const QwenEncoderDownsample * d,
                                                             struct ggml_tensor *          x) {
-    return qwen_causal_conv1d(ctx, d->weight, NULL, x, d->kernel, 1, d->stride);
+    return qwen_causal_conv1d(ctx, d->weight, NULL, x, d->kernel, 1, d->stride, QWEN_PAD_REPLICATE);
 }

@@ -8,7 +8,8 @@
 //   - No biases on q/k/v/o projections
 //   - 8 attention heads instead of 16
 //   - intermediate_size 2048 instead of 1024
-//   - Causal sliding window 250 frames instead of 72
+//   - Pure causal attention, full T x T mask (the upstream config carries
+//     a sliding_window field but Mimi never applies it)
 //   - No top-level input_proj / output_proj brackets: the SEANet output
 //     already has hidden_size channels
 //
@@ -59,7 +60,6 @@ struct QwenEncoderTransformer {
     int   num_kv_heads;
     int   head_dim;
     int   intermediate_size;
-    int   sliding_window;
     float rope_theta;
     float norm_eps;
 
@@ -76,7 +76,6 @@ static bool qwen_encoder_transformer_load(QwenEncoderTransformer * tr, const GGU
     tr->num_kv_heads        = (int) gf_get_u32(gf, "qwen3-tts-tokenizer.encoder.num_key_value_heads");
     tr->head_dim            = (int) gf_get_u32(gf, "qwen3-tts-tokenizer.encoder.head_dim");
     tr->intermediate_size   = (int) gf_get_u32(gf, "qwen3-tts-tokenizer.encoder.intermediate_size");
-    tr->sliding_window      = (int) gf_get_u32(gf, "qwen3-tts-tokenizer.encoder.sliding_window");
     tr->rope_theta          = gf_get_f32(gf, "qwen3-tts-tokenizer.encoder.rope_theta");
     tr->norm_eps            = gf_get_f32(gf, "qwen3-tts-tokenizer.encoder.norm_eps");
 
@@ -119,9 +118,9 @@ static bool qwen_encoder_transformer_load(QwenEncoderTransformer * tr, const GGU
 
     fprintf(stderr,
             "[EncTransformer] Loaded: %d layers, hidden %d, heads %d/%d, head_dim %d, "
-            "FFN %d, RoPE theta %.0f, sliding window %d\n",
+            "FFN %d, RoPE theta %.0f\n",
             tr->num_layers, tr->hidden_size, tr->num_attention_heads, tr->num_kv_heads, tr->head_dim,
-            tr->intermediate_size, tr->rope_theta, tr->sliding_window);
+            tr->intermediate_size, tr->rope_theta);
     return true;
 }
 
@@ -137,11 +136,10 @@ static void qwen_encoder_transformer_free(QwenEncoderTransformer * tr) {
 }
 
 // Build a [T, T] additive causal mask (0 where allowed, -inf where masked).
-// Pure causal : k <= q. Even though the upstream config carries a
-// sliding_window field, MimiAttention's eager forward does not apply it
-// (only the eager attention_mask is used) and MimiTransformerModel calls
-// create_causal_mask() which is non-sliding. The Qwen3TTS encoder side
-// inherits this convention, so we mirror it bit for bit here.
+// Pure causal : k <= q. The upstream config carries a sliding_window
+// value but neither MimiAttention's eager forward nor MimiTransformerModel
+// (create_causal_mask) ever apply it. The Qwen3TTS encoder inherits this
+// convention, so we mirror it bit for bit here.
 static void qwen_encoder_build_causal_mask(int T, std::vector<float> & dst) {
     dst.assign((size_t) T * (size_t) T, -INFINITY);
     for (int q = 0; q < T; q++) {

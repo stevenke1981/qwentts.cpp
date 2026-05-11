@@ -130,20 +130,31 @@ static struct ggml_tensor * qwen_causal_trans_conv1d(struct ggml_context * ctx,
 //   w: [k, IC, OC] f32, source layout (K, IC, OC) maps to ggml ne directly
 //   b: [OC] f32 or NULL
 //   x: [T, IC] f32 T-first
+//   pad_mode: QWEN_PAD_CONSTANT (zero pad, default for SEANet and the DAC
+//             decoder) or QWEN_PAD_REPLICATE (edge pad, replicates the
+//             first / last frame to match Mimi's downsample which is the
+//             only conv passing pad_mode="replicate" upstream).
 // Returns [ceil(T / stride), OC] f32 T-first.
+enum QwenPadMode {
+    QWEN_PAD_CONSTANT  = 0,
+    QWEN_PAD_REPLICATE = 1,
+};
+
 static struct ggml_tensor * qwen_causal_conv1d(struct ggml_context * ctx,
                                                struct ggml_tensor *  w,
                                                struct ggml_tensor *  b,
                                                struct ggml_tensor *  x,
                                                int                   k,
                                                int                   d,
-                                               int                   s = 1) {
+                                               int                   s        = 1,
+                                               int                   pad_mode = QWEN_PAD_CONSTANT) {
     int OC          = (int) w->ne[2];
     int kernel_eff  = (k - 1) * d + 1;
     int padding_tot = kernel_eff - s;
 
     // Mimi extra padding: ensures the causal conv lands on a stride boundary
-    // by adding zeros on the right before the convolution.
+    // by extending the input on the right with zeros or replicated edges
+    // depending on pad_mode.
     int T         = (int) x->ne[0];
     int n_frames  = (T + padding_tot - kernel_eff + s - 1) / s + 1;
     int ideal_len = (n_frames - 1) * s + kernel_eff - padding_tot;
@@ -153,7 +164,24 @@ static struct ggml_tensor * qwen_causal_conv1d(struct ggml_context * ctx,
     }
 
     struct ggml_tensor * y = x;
-    if (padding_tot > 0 || extra_pad > 0) {
+    if (pad_mode == QWEN_PAD_REPLICATE) {
+        // Edge pad: repeat x[t=0] padding_tot times on the left and x[t=T-1]
+        // extra_pad times on the right via a single ggml_repeat per side.
+        int IC = (int) x->ne[1];
+        if (padding_tot > 0) {
+            struct ggml_tensor * first = ggml_view_2d(ctx, x, 1, IC, x->nb[1], 0);
+            struct ggml_tensor * tmpl  = ggml_new_tensor_2d(ctx, x->type, padding_tot, IC);
+            struct ggml_tensor * lp    = ggml_repeat(ctx, first, tmpl);
+            y                          = ggml_concat(ctx, lp, y, 0);
+        }
+        if (extra_pad > 0) {
+            size_t               last_off = (size_t) (T - 1) * x->nb[1];
+            struct ggml_tensor * last     = ggml_view_2d(ctx, x, 1, IC, x->nb[1], last_off);
+            struct ggml_tensor * tmpl     = ggml_new_tensor_2d(ctx, x->type, extra_pad, IC);
+            struct ggml_tensor * rp       = ggml_repeat(ctx, last, tmpl);
+            y                             = ggml_concat(ctx, y, rp, 0);
+        }
+    } else if (padding_tot > 0 || extra_pad > 0) {
         y = ggml_pad_ext(ctx, y, padding_tot, extra_pad, 0, 0, 0, 0, 0, 0);
     }
 
