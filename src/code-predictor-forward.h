@@ -1,6 +1,7 @@
 #pragma once
 // code-predictor-forward.h : run the 5-layer Qwen3 code predictor over a
-// growing context to produce the 15 acoustic codes of one audio frame.
+// growing context to produce the 15 acoustic codes of one audio frame,
+// KV cached.
 //
 // Input :
 //   talker_hidden_last [hidden] f32   -- last position hidden state from
@@ -12,14 +13,15 @@
 //                                        frame, ready for decode through
 //                                        the codec
 //
-// Phase 4.5 runs the predictor without a KV cache : every step rebuilds
-// the full graph over a context of length g+2 (g being the predictor
-// step, 0..14). With 5 layers and at most 16 tokens this is well below
-// the threshold where caching would matter. A KV-cached variant lands
-// in the generation loop phase.
+// The predictor cache is local to a single frame : we reset it at every
+// frame, prefill the first two positions (talker_hidden + embed(c0)),
+// then decode 14 single-token steps. Total work drops from
+// O(sum_{g=0..14} (g+2)^2) = O(1496 token-steps) to O(16) per frame,
+// roughly 90x for the inner loop.
 
 #include "code-predictor-weights.h"
 #include "ggml-backend.h"
+#include "kv-cache.h"
 #include "sampling.h"
 #include "talker-weights.h"
 
@@ -39,6 +41,7 @@ struct CodePredictorOutput {
 // Returns the full vector of 16 codes. dump_dir may be NULL.
 bool code_predictor_step(const TalkerWeights *        tw,
                          const CodePredictorWeights * cw,
+                         KVCache *                    kv,
                          ggml_backend_sched_t         sched,
                          const float *                talker_hidden_last,
                          int                          c0,

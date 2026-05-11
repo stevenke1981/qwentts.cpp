@@ -11,6 +11,7 @@
 #include "code-predictor-weights.h"
 #include "ggml-backend.h"
 #include "gguf-weights.h"
+#include "kv-cache.h"
 #include "pipeline-codec.h"
 #include "speaker-encoder-weights.h"
 #include "talker-weights.h"
@@ -88,6 +89,12 @@ struct PipelineTTS {
     BackendPair          bp;
     ggml_backend_t       backend;
     ggml_backend_sched_t sched;
+
+    // Persistent KV caches : the talker holds the LM context, the
+    // predictor holds one frame's 16 sub-steps and gets reset every
+    // frame in code_predictor_step.
+    KVCache talker_kv;
+    KVCache code_predictor_kv;
 };
 
 // Open the talker GGUF and the codec GGUF, load every module on the

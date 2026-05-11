@@ -38,14 +38,22 @@ static bool is_bisect_layer(int l) {
     return false;
 }
 
-// Build the per-layer block. Returns the layer output [hidden, T].
+// Build the per-layer block, KV cached. K and V for the T fresh
+// positions get computed normally, then written into the cache at
+// [n_past, n_past+T) on dim 1. The attention reads the contiguous slice
+// [0, n_past+T) on the same dim, which covers the full causal context
+// in one tensor view. Returns the layer output [hidden, T].
 static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
                                                  const TalkerWeights * tw,
                                                  const TalkerLayer &   layer,
                                                  struct ggml_tensor *  x,
                                                  struct ggml_tensor *  positions,
                                                  struct ggml_tensor *  mask,
-                                                 int                   T) {
+                                                 struct ggml_tensor *  k_cache,
+                                                 struct ggml_tensor *  v_cache,
+                                                 int                   n_past,
+                                                 int                   T,
+                                                 struct ggml_cgraph *  gf) {
     const int   n_q_heads = tw->num_attention_heads;
     const int   n_kv      = tw->num_key_value_heads;
     const int   hd        = tw->head_dim;
@@ -80,15 +88,38 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
     k = ggml_rope_ext(ctx, k, positions, NULL, hd, GGML_ROPE_TYPE_NEOX, 0, tw->rope_theta, 1.0f, 0.0f, 1.0f, 0.0f,
                       0.0f);
 
-    // Attention layout : [hd, T, n_heads]. ggml_mul_mat broadcasts on
-    // dims 2/3 when source has fewer heads than destination, which is
-    // exactly the GQA case with n_q_heads = n_kv * n_rep, no explicit
-    // repeat_kv needed.
-    struct ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
-    struct ggml_tensor * k_p = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
-    struct ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));  // [T, n_kv, hd]
+    // Write the T fresh positions of K and V into the cache. K and V are
+    // [hd, n_kv, T] at this point and the cache lives as [hd, max_T, n_kv]
+    // so we permute to [hd, T, n_kv] before the cpy. The destination view
+    // covers [hd, T, n_kv] at dim 1 offset n_past * nb1.
+    struct ggml_tensor * k_perm = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));  // [hd, T, n_kv]
+    struct ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));  // [hd, T, n_kv]
 
-    struct ggml_tensor * scores = ggml_mul_mat(ctx, k_p, q_p);
+    size_t k_off = (size_t) n_past * k_cache->nb[1];
+    size_t v_off = (size_t) n_past * v_cache->nb[1];
+
+    struct ggml_tensor * k_dst = ggml_view_3d(ctx, k_cache, hd, T, n_kv, k_cache->nb[1], k_cache->nb[2], k_off);
+    struct ggml_tensor * v_dst = ggml_view_3d(ctx, v_cache, hd, T, n_kv, v_cache->nb[1], v_cache->nb[2], v_off);
+
+    struct ggml_tensor * k_cpy = ggml_cpy(ctx, k_perm, k_dst);
+    struct ggml_tensor * v_cpy = ggml_cpy(ctx, v_perm, v_dst);
+    ggml_build_forward_expand(gf, k_cpy);
+    ggml_build_forward_expand(gf, v_cpy);
+
+    // Read the [0, n_past + T) window for attention. The cache slice is
+    // already in the [hd, T_full, n_kv] layout we want, so K_p = view.
+    const int            T_full = n_past + T;
+    struct ggml_tensor * k_full = ggml_view_3d(ctx, k_cache, hd, T_full, n_kv, k_cache->nb[1], k_cache->nb[2], 0);
+    struct ggml_tensor * v_full = ggml_view_3d(ctx, v_cache, hd, T_full, n_kv, v_cache->nb[1], v_cache->nb[2], 0);
+
+    // Attention layout : [hd, T_full, n_kv] for K, [hd, T, n_q_heads] for Q,
+    // [T_full, n_kv, hd] for V. ggml_mul_mat broadcasts on dims 2/3 when
+    // source has fewer heads than destination, which is exactly the GQA
+    // case with n_q_heads = n_kv * n_rep, no explicit repeat_kv needed.
+    struct ggml_tensor * q_p = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+    struct ggml_tensor * v_p = ggml_cont(ctx, ggml_permute(ctx, v_full, 1, 0, 2, 3));  // [T_full, hd, n_kv]
+
+    struct ggml_tensor * scores = ggml_mul_mat(ctx, k_full, q_p);
     ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
 
     float scale = 1.0f / sqrtf((float) hd);
@@ -116,21 +147,28 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
     return x;
 }
 
-bool talker_forward_prefill(const TalkerWeights * tw,
-                            ggml_backend_sched_t  sched,
-                            const float *         input_embed,
-                            int                   T,
-                            const char *          dump_dir,
-                            TalkerForwardOutput * out) {
+// Shared core that builds the graph, allocates, uploads inputs, runs
+// it and pulls out the last position hidden + logits. T tokens are
+// appended to the cache starting at n_past. When n_past == 0 and
+// dump_dir is set, the bisect taps fire on the prefill path.
+static bool talker_forward_core(const TalkerWeights * tw,
+                                KVCache *             kv,
+                                ggml_backend_sched_t  sched,
+                                const float *         input_embed,
+                                int                   T,
+                                int                   n_past,
+                                const char *          dump_dir,
+                                TalkerForwardOutput * out) {
     const int hidden   = tw->hidden_size;
     const int n_layers = tw->num_hidden_layers;
     const int vocab    = tw->vocab_size;
+    const int T_full   = n_past + T;
 
     // Dedicated context for graph + IO tensors. Counts approximate :
-    //   per layer : ~30 ops -> ~30 graph nodes
+    //   per layer : ~38 ops (added 2 cpy + 4 views per layer for KV)
     //   IO        : 4 tensors (input embed, positions, mask, output norm)
-    //   final     : norm + codec_head + ~3 dump branches
-    const int    max_nodes         = 32 * n_layers + 256;
+    //   final     : norm + codec_head + dump branches
+    const int    max_nodes         = 48 * n_layers + 256;
     const size_t graph_arena_bytes = ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false);
 
     struct ggml_init_params gparams = {
@@ -144,24 +182,27 @@ bool talker_forward_prefill(const TalkerWeights * tw,
         return false;
     }
 
-    // IO tensors : input embedding, positions, causal mask
+    // IO tensors : input embedding, positions, causal mask. The mask
+    // spans [T_full, T] : for each fresh query q in [0, T) we allow
+    // keys k in [0, n_past + q]. In the decode case (T=1) this is a
+    // single row of zeros of length T_full.
     struct ggml_tensor * x_in    = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, hidden, T);
     struct ggml_tensor * pos_in  = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T);
-    struct ggml_tensor * mask_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, T, T);
+    struct ggml_tensor * mask_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, T_full, T);
     ggml_set_name(x_in, "input_embed");
     ggml_set_name(pos_in, "positions");
     ggml_set_name(mask_in, "causal_mask");
 
-    // Build the layer stack. We collect bisect taps into a vector so the
-    // graph keeps them as roots and the scheduler does not optimize them
-    // away.
     struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, max_nodes, false);
 
-    struct ggml_tensor *              h = x_in;
+    // Build the layer stack. Bisect taps fire on prefill only.
+    const bool                        record_taps = (dump_dir != NULL) && (n_past == 0);
+    struct ggml_tensor *              h           = x_in;
     std::vector<struct ggml_tensor *> taps(N_BISECT_LAYERS, NULL);
     for (int l = 0; l < n_layers; l++) {
-        h = talker_layer_forward(gctx, tw, tw->layers[(size_t) l], h, pos_in, mask_in, T);
-        if (dump_dir && is_bisect_layer(l)) {
+        h = talker_layer_forward(gctx, tw, tw->layers[(size_t) l], h, pos_in, mask_in, kv->k[(size_t) l],
+                                 kv->v[(size_t) l], n_past, T, gf);
+        if (record_taps && is_bisect_layer(l)) {
             for (int i = 0; i < N_BISECT_LAYERS; i++) {
                 if (BISECT_LAYERS[i] == l) {
                     char tap_name[64];
@@ -184,8 +225,7 @@ bool talker_forward_prefill(const TalkerWeights * tw,
     struct ggml_tensor * logits = ggml_mul_mat(gctx, tw->codec_head_w, h_final);
     ggml_set_name(logits, "logits");
 
-    // Wire dump roots and final outputs into the graph.
-    if (dump_dir) {
+    if (record_taps) {
         for (int i = 0; i < N_BISECT_LAYERS; i++) {
             if (taps[(size_t) i]) {
                 ggml_build_forward_expand(gf, taps[(size_t) i]);
@@ -195,10 +235,6 @@ bool talker_forward_prefill(const TalkerWeights * tw,
     }
     ggml_build_forward_expand(gf, logits);
 
-    // Allocate intermediate buffers via the scheduler. The scheduler
-    // partitions ops between the GPU and the CPU fallback before
-    // alloc_graph wires up the buffers, so K-quant get_rows that the
-    // GPU backend cannot run land on the CPU instead of asserting.
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
         fprintf(stderr, "[TalkerForward] FATAL: graph allocation failed\n");
         ggml_backend_sched_reset(sched);
@@ -207,33 +243,30 @@ bool talker_forward_prefill(const TalkerWeights * tw,
     }
 
     // Upload input embedding (host [T, hidden] -> ggml [hidden, T]).
-    // The host buffer is row-major with hidden as the inner axis, which
-    // matches ggml's ne[0]-fastest layout exactly.
     ggml_backend_tensor_set(x_in, input_embed, 0, (size_t) T * (size_t) hidden * sizeof(float));
 
-    // Positions 0..T-1
+    // Positions : n_past .. n_past + T - 1
     {
         std::vector<int32_t> pos((size_t) T);
         for (int i = 0; i < T; i++) {
-            pos[(size_t) i] = i;
+            pos[(size_t) i] = n_past + i;
         }
         ggml_backend_tensor_set(pos_in, pos.data(), 0, (size_t) T * sizeof(int32_t));
     }
 
-    // Causal mask : 0 on/below diagonal, -inf above. Stored row-major
-    // [T_q, T_k] with T_k as the fast axis (ne[0]).
+    // Causal mask : 0 where k <= n_past + q, -inf otherwise. Stored
+    // row-major [T_q, T_k] with T_k as the fast axis (ne[0]).
     {
-        std::vector<float> mask((size_t) T * (size_t) T, -INFINITY);
+        std::vector<float> mask((size_t) T * (size_t) T_full, -INFINITY);
         for (int q = 0; q < T; q++) {
-            for (int k = 0; k <= q; k++) {
-                mask[(size_t) q * (size_t) T + (size_t) k] = 0.0f;
+            const int q_pos = n_past + q;
+            for (int k = 0; k <= q_pos; k++) {
+                mask[(size_t) q * (size_t) T_full + (size_t) k] = 0.0f;
             }
         }
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(float));
     }
 
-    // Compute through the scheduler so cross-backend op placement stays
-    // honoured for every node in the graph.
     if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[TalkerForward] FATAL: graph compute failed\n");
         ggml_backend_sched_reset(sched);
@@ -241,9 +274,8 @@ bool talker_forward_prefill(const TalkerWeights * tw,
         return false;
     }
 
-    // Bisect dumps : pull each tap [hidden, T] back to host as [T, hidden]
-    // f32 row-major (which is exactly the ggml byte layout).
-    if (dump_dir) {
+    // Bisect dumps : pull each tap [hidden, T] back to host as [T, hidden].
+    if (record_taps) {
         DebugDumper d;
         debug_init(&d, dump_dir);
         std::vector<float> buf((size_t) T * (size_t) hidden);
@@ -266,9 +298,6 @@ bool talker_forward_prefill(const TalkerWeights * tw,
     out->hidden_last.assign((size_t) hidden, 0.0f);
     out->logits_last.assign((size_t) vocab, 0.0f);
     {
-        // Logits ggml shape : [vocab, T]. We want the row at column T-1.
-        // Layout : data[t * vocab + v], so the offset for t = T-1 is
-        // (T-1) * vocab * 4 bytes.
         size_t row_bytes = (size_t) vocab * sizeof(float);
         ggml_backend_tensor_get(logits, out->logits_last.data(), (size_t) (T - 1) * row_bytes, row_bytes);
 
@@ -276,13 +305,45 @@ bool talker_forward_prefill(const TalkerWeights * tw,
         ggml_backend_tensor_get(h_final, out->hidden_last.data(), (size_t) (T - 1) * hrow_bytes, hrow_bytes);
     }
 
-    if (dump_dir) {
+    if (record_taps) {
         DebugDumper d;
         debug_init(&d, dump_dir);
         debug_dump_1d(&d, "talker-logits-prefill", out->logits_last.data(), vocab);
     }
 
+    // Advance the cache write head. The graph already executed the cpy
+    // nodes so positions [n_past, n_past + T) are now populated.
+    kv->cur_len = T_full;
+
     ggml_backend_sched_reset(sched);
     ggml_free(gctx);
     return true;
+}
+
+bool talker_forward_prefill(const TalkerWeights * tw,
+                            KVCache *             kv,
+                            ggml_backend_sched_t  sched,
+                            const float *         input_embed,
+                            int                   T,
+                            const char *          dump_dir,
+                            TalkerForwardOutput * out) {
+    kv_cache_reset(kv);
+    if (T > kv->max_seq_len) {
+        fprintf(stderr, "[TalkerForward] FATAL: prefill T=%d exceeds cache max_seq_len=%d\n", T, kv->max_seq_len);
+        return false;
+    }
+    return talker_forward_core(tw, kv, sched, input_embed, T, 0, dump_dir, out);
+}
+
+bool talker_forward_decode(const TalkerWeights * tw,
+                           KVCache *             kv,
+                           ggml_backend_sched_t  sched,
+                           const float *         input_embed_1,
+                           TalkerForwardOutput * out) {
+    if (kv->cur_len + 1 > kv->max_seq_len) {
+        fprintf(stderr, "[TalkerForward] FATAL: decode would overflow cache (%d + 1 > %d)\n", kv->cur_len,
+                kv->max_seq_len);
+        return false;
+    }
+    return talker_forward_core(tw, kv, sched, input_embed_1, 1, kv->cur_len, NULL, out);
 }

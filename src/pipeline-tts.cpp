@@ -167,13 +167,45 @@ bool pipeline_tts_load(PipelineTTS * pt, const char * talker_gguf_path, const ch
         return false;
     }
 
-    // Scheduler shared by talker_forward_prefill and code_predictor_step.
+    // Scheduler shared by talker_forward_* and code_predictor_step.
     // Routes ops the GPU backend cannot run (typical case : K-quant
     // get_rows on CUDA) to the CPU backend. 4096 nodes covers the 28L
-    // Qwen3 talker graph (~32 ops per layer + heads + dump taps) with
+    // Qwen3 talker graph (~48 ops per layer with KV cache writes) with
     // headroom ; the 5L code predictor uses a fraction of that.
     pt->sched = backend_sched_new(bp, 4096);
     if (!pt->sched) {
+        pipeline_codec_free(&pt->codec);
+        if (pt->has_speaker_encoder) {
+            speaker_encoder_weights_free(&pt->speaker_encoder);
+        }
+        code_predictor_weights_free(&pt->code_predictor);
+        talker_weights_free(&pt->talker);
+        gf_close(&pt->gguf_talker);
+        return false;
+    }
+
+    // KV caches : talker holds the LM context up to 4096 positions (the
+    // longest ICL prompt observed is ~250 + max_new_tokens ~ 1500, so
+    // 4096 has 60% headroom). Predictor holds one frame of 16 sub-steps.
+    if (!kv_cache_init(&pt->talker_kv, pt->talker.num_hidden_layers, pt->talker.num_key_value_heads,
+                       pt->talker.head_dim, 4096, pt->backend)) {
+        ggml_backend_sched_free(pt->sched);
+        pt->sched = NULL;
+        pipeline_codec_free(&pt->codec);
+        if (pt->has_speaker_encoder) {
+            speaker_encoder_weights_free(&pt->speaker_encoder);
+        }
+        code_predictor_weights_free(&pt->code_predictor);
+        talker_weights_free(&pt->talker);
+        gf_close(&pt->gguf_talker);
+        return false;
+    }
+    if (!kv_cache_init(&pt->code_predictor_kv, pt->code_predictor.num_hidden_layers,
+                       pt->code_predictor.num_key_value_heads, pt->code_predictor.head_dim, pt->num_code_groups,
+                       pt->backend)) {
+        kv_cache_free(&pt->talker_kv);
+        ggml_backend_sched_free(pt->sched);
+        pt->sched = NULL;
         pipeline_codec_free(&pt->codec);
         if (pt->has_speaker_encoder) {
             speaker_encoder_weights_free(&pt->speaker_encoder);
@@ -192,6 +224,8 @@ bool pipeline_tts_load(PipelineTTS * pt, const char * talker_gguf_path, const ch
 }
 
 void pipeline_tts_free(PipelineTTS * pt) {
+    kv_cache_free(&pt->code_predictor_kv);
+    kv_cache_free(&pt->talker_kv);
     if (pt->sched) {
         ggml_backend_sched_free(pt->sched);
         pt->sched = NULL;
@@ -347,11 +381,11 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
     float subtk_T   = params.subtalker_do_sample ? params.subtalker_temperature : 0.0f;
     float talker_rp = params.repetition_penalty;
 
-    std::vector<float> ctx_embed;
-    ctx_embed.reserve((size_t) (prompt.T_ctx + params.max_new_tokens) * (size_t) hidden);
-    ctx_embed.insert(ctx_embed.end(), prompt.input_embed.begin(), prompt.input_embed.end());
-    int T_ctx = prompt.T_ctx;
-
+    // Generation loop : step 0 prefills the talker over the full prompt
+    // and writes T_ctx positions into the KV cache. Subsequent steps
+    // feed one next_emb at a time and append one position. The code
+    // predictor maintains its own per-frame cache that gets reset at
+    // every step.
     std::vector<std::vector<int32_t>> all_codes;
     all_codes.reserve((size_t) params.max_new_tokens);
 
@@ -363,18 +397,27 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
     // sample (one for c0 of each step, then 15 for the predictor codes).
     int64_t subseq_counter = 0;
 
+    std::vector<float> next_emb((size_t) hidden, 0.0f);
+
     for (int step = 0; step < params.max_new_tokens; step++) {
         TalkerForwardOutput fw;
         const char *        step_dump = (params.dump_dir && step == 0) ? params.dump_dir : NULL;
-        if (!talker_forward_prefill(&pt->talker, pt->sched, ctx_embed.data(), T_ctx, step_dump, &fw)) {
+        bool                ok;
+        if (step == 0) {
+            ok = talker_forward_prefill(&pt->talker, &pt->talker_kv, pt->sched, prompt.input_embed.data(), prompt.T_ctx,
+                                        step_dump, &fw);
+        } else {
+            ok = talker_forward_decode(&pt->talker, &pt->talker_kv, pt->sched, next_emb.data(), &fw);
+        }
+        if (!ok) {
             return false;
         }
 
         // Bisection dump : the talker hidden_last at step 1 is the input
         // the code predictor consumes after consuming the next-emb of
         // step 0. Pairing it byte for byte with the Python hook tells us
-        // whether the next-emb composition + talker re-prefill round
-        // trip is bit exact end to end.
+        // whether the next-emb composition + talker decode round trip
+        // is bit exact end to end.
         if (params.dump_dir && step == 1) {
             DebugDumper d;
             debug_init(&d, params.dump_dir);
@@ -408,9 +451,9 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
 
         CodePredictorOutput cp;
         const char *        cp_dump = (params.dump_dir && step == 0) ? params.dump_dir : NULL;
-        if (!code_predictor_step(&pt->talker, &pt->code_predictor, pt->sched, fw.hidden_last.data(), c0, subtk_T,
-                                 params.subtalker_top_k, params.subtalker_top_p, params.seed, subseq_counter - 1,
-                                 cp_dump, &cp)) {
+        if (!code_predictor_step(&pt->talker, &pt->code_predictor, &pt->code_predictor_kv, pt->sched,
+                                 fw.hidden_last.data(), c0, subtk_T, params.subtalker_top_k, params.subtalker_top_p,
+                                 params.seed, subseq_counter - 1, cp_dump, &cp)) {
             return false;
         }
         // Predictor consumed (num_codebooks - 1) subsequences after the
@@ -423,7 +466,7 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
         // Build next-token embedding : sum of 16 codebook embeddings.
         // codebook 0 uses talker.codec_embedding, the 15 acoustic
         // codebooks use the predictor's private embedding tables.
-        std::vector<float> next_emb((size_t) hidden, 0.0f);
+        std::fill(next_emb.begin(), next_emb.end(), 0.0f);
         std::vector<float> tmp((size_t) hidden);
 
         embed_row_from_gguf(pt->gguf_talker, "talker.codec_embd.weight", c0, hidden, tmp.data());
@@ -449,9 +492,6 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
         for (int i = 0; i < hidden; i++) {
             next_emb[(size_t) i] += overlay[(size_t) i];
         }
-
-        ctx_embed.insert(ctx_embed.end(), next_emb.begin(), next_emb.end());
-        T_ctx++;
 
         // Bisection dump : the next-token embedding produced at step 0
         // is the only thing controlling the talker forward at step 1, so
