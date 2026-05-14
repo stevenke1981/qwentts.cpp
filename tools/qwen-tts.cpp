@@ -9,8 +9,7 @@
 // from GGUF metadata at qt_init time. The CLI surface mirrors the
 // omnivoice.cpp tooling: kebab-case flags, --format wav16/wav24/wav32,
 // -o '-' streams to stdout, --seed -1 means non deterministic
-// (resolved inside qt_synthesize), the utterance text comes from
-// --text or stdin if --text is absent.
+// (resolved inside qt_synthesize), the utterance text is read from stdin.
 
 #include "audio-io.h"
 #include "qwen.h"
@@ -26,59 +25,44 @@
 static void print_usage(const char * prog) {
     fprintf(stderr, "qwentts.cpp %s\n\n", qt_version());
     fprintf(stderr,
-            "Usage: %s --model <gguf> --codec <gguf> [options] -o <out.wav>\n\n"
+            "Usage: %s --model <gguf> --codec <gguf> [options] -o <out.wav> < text.txt\n\n"
             "Required:\n"
             "  --model <gguf>          Talker LM GGUF (qwen-talker-*.gguf)\n"
-            "  --codec <gguf>          Tokenizer GGUF (qwen-tokenizer-*.gguf)\n"
-            "  -o <path>               Output WAV. '-' streams to stdout (pipe friendly).\n\n"
+            "  --codec <gguf>          Codec GGUF (qwen-tokenizer-*.gguf)\n"
+            "  -o <path>               Output WAV (24 kHz mono). '-' streams to stdout (pipe friendly).\n\n"
             "Input:\n"
-            "  --text <s>              Utterance text. If absent, stdin is read fully.\n\n"
-            "Synthesis options:\n"
-            "  --lang <name>           Language (auto, english, chinese, ...) (default: english)\n"
-            "  --instruct <s>          Style instruction. Required for VoiceDesign, optional\n"
-            "                          for CustomVoice. Rejected for Base.\n"
-            "  --speaker <name>        Speaker name. Only valid for CustomVoice.\n"
-            "  --ref-wav <wav>       Reference WAV path for voice clone (Base only). Mutually\n"
-            "                          exclusive with --speaker. Mode A (x_vector_only) extracts\n"
-            "                          a speaker embedding via the ECAPA-TDNN encoder.\n"
-            "  --ref-text <path>       Path to a UTF-8 text file containing the reference\n"
-            "                          transcript for voice clone ICL mode (Base only, requires\n"
-            "                          --ref-wav). Switches the prompt to ICL mode B where the\n"
-            "                          talker conditions on the reference codec codes.\n"
+            "  stdin                   Target text to synthesise. Read fully then synthesised in one shot.\n\n"
+            "Optional:\n"
+            "  --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)\n"
+            "  --lang <name>           Language label (default: english)\n"
+            "  --instruct <str>        Style instruction. Required for VoiceDesign, optional for\n"
+            "                          CustomVoice, rejected for Base\n"
+            "  --speaker <name>        Speaker name (CustomVoice only)\n"
+            "  --ref-wav <path>        Reference WAV for voice cloning (Base only)\n"
+            "  --ref-text <path>       Transcript file for the reference (enables ICL clone mode)\n"
             "  --max-new <n>           Max new audio frames (default: 2048)\n"
-            "  --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)\n\n"
-            "Sampling options:\n"
-            "  --seed <n>              Sampling seed, -1 for random (default: -1)\n"
+            "  --codec-chunk-dur <f>   Codec decode chunk duration in seconds (default: 24.0)\n"
+            "  --codec-left-dur <f>    Codec decode left context duration in seconds (default: 2.0)\n\n"
+            "Sampling:\n"
+            "  --seed <int>            Sampling seed (default: -1 for random)\n"
             "  --greedy                Disable stochastic sampling on both stacks\n"
             "  --temp <f>              Talker temperature (default: 0.9)\n"
-            "  --top-k <n>             Talker top-k (default: 50, 0 = disabled)\n"
+            "  --top-k <n>             Talker top-k (default: 50, 0 disables)\n"
             "  --top-p <f>             Talker top-p (default: 1.0)\n"
             "  --rep-pen <f>           Talker repetition penalty (default: 1.05)\n"
             "  --sub-temp <f>          Sub-talker temperature (default: 0.9)\n"
             "  --sub-top-k <n>         Sub-talker top-k (default: 50)\n"
             "  --sub-top-p <f>         Sub-talker top-p (default: 1.0)\n\n"
-            "Backend options:\n"
-            "  --no-fa                 Disable flash attention (manual F32 attention chain)\n"
-            "  --clamp-fp16            Clamp hidden states + V to FP16 range (sub Ampere CUDA)\n\n"
-            "Codec decode framing:\n"
-            "  --codec-chunk-sec <f>          Decode chunk size in seconds (default: 24.0,\n"
-            "                                 = 300 frames at 12.5 Hz, matches the upstream\n"
-            "                                 Qwen3-TTS 12 Hz tokenizer chunked_decode).\n"
-            "                                 Lower values reduce streaming latency at the\n"
-            "                                 cost of more frequent codec passes.\n"
-            "  --codec-left-context-sec <f>   Left context window in seconds (default: 2.0,\n"
-            "                                 = 25 frames at 12.5 Hz, upstream default).\n"
-            "                                 Re uses previously decoded frames to remove\n"
-            "                                 edge artefacts at chunk boundaries.\n\n"
             "Debug:\n"
-            "  --dump <dir>            Dump intermediate tensors for cossim debug\n",
+            "  --no-fa                 Disable flash attention\n"
+            "  --clamp-fp16            Clamp hidden states + V to FP16 range\n"
+            "  --dump <dir>            Dump intermediate tensors (f32) to <dir>\n",
             prog);
 }
 
 struct Args {
     const char * model;
     const char * codec;
-    const char * text;
     const char * lang;
     const char * instruct;
     const char * speaker;
@@ -105,7 +89,7 @@ struct Args {
 };
 
 // Read all of stdin into a string. Trims trailing newlines so a piped
-// text file behaves like a clean --text argument.
+// text file behaves like clean utterance input.
 static std::string read_stdin_text() {
     std::ostringstream ss;
     ss << std::cin.rdbuf();
@@ -172,8 +156,6 @@ static bool parse_args(int argc, char ** argv, Args & a) {
             a.model = argv[++i];
         } else if (std::strcmp(arg, "--codec") == 0 && i + 1 < argc) {
             a.codec = argv[++i];
-        } else if (std::strcmp(arg, "--text") == 0 && i + 1 < argc) {
-            a.text = argv[++i];
         } else if (std::strcmp(arg, "--lang") == 0 && i + 1 < argc) {
             a.lang = argv[++i];
         } else if (std::strcmp(arg, "--instruct") == 0 && i + 1 < argc) {
@@ -218,9 +200,9 @@ static bool parse_args(int argc, char ** argv, Args & a) {
             a.use_fa = false;
         } else if (std::strcmp(arg, "--clamp-fp16") == 0) {
             a.clamp_fp16 = true;
-        } else if (std::strcmp(arg, "--codec-chunk-sec") == 0 && i + 1 < argc) {
+        } else if (std::strcmp(arg, "--codec-chunk-dur") == 0 && i + 1 < argc) {
             a.codec_chunk_sec = (float) std::atof(argv[++i]);
-        } else if (std::strcmp(arg, "--codec-left-context-sec") == 0 && i + 1 < argc) {
+        } else if (std::strcmp(arg, "--codec-left-dur") == 0 && i + 1 < argc) {
             a.codec_left_context_sec = (float) std::atof(argv[++i]);
         } else if (std::strcmp(arg, "-o") == 0 && i + 1 < argc) {
             a.out_wav = argv[++i];
@@ -299,19 +281,17 @@ static int run(const Args & a) {
         return 1;
     }
 
-    // Resolve utterance text: explicit --text wins, otherwise read stdin
-    // fully. Empty stdin combined with no --text triggers a clean error.
-    std::string  text_buf;
-    const char * text = a.text;
-    if (!text) {
-        text_buf = read_stdin_text();
-        if (text_buf.empty()) {
-            fprintf(stderr, "[CLI] ERROR: no --text and stdin is empty\n");
-            qt_free(q);
-            return 1;
-        }
-        text = text_buf.c_str();
+    // Resolve utterance text: read stdin fully. Empty stdin triggers a
+    // clean error. Inline text on the command line is intentionally not
+    // supported: shell quoting and special characters belong in a file
+    // or piped input, never in argv.
+    std::string text_buf = read_stdin_text();
+    if (text_buf.empty()) {
+        fprintf(stderr, "[CLI] ERROR: stdin is empty, nothing to synthesise\n");
+        qt_free(q);
+        return 1;
     }
+    const char * text = text_buf.c_str();
 
     // Translate CLI args into the facade params. Seed -1 is forwarded
     // verbatim and resolved by qt_synthesize via std::random_device.
