@@ -40,9 +40,8 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 # Audio tokenizer tensor names can exceed default GGML_MAX_NAME of 64
 add_compile_definitions(GGML_MAX_NAME=128)
 
-# Harden: mark fread/fwrite/etc with warn_unused_result on all platforms.
-# Disabled for SYCL: _FORTIFY_SOURCE replaces memcpy with __memcpy_chk
-# which is unresolvable in GPU device code and aborts kernel compilation.
+# Harden: mark fread/fwrite/etc with warn_unused_result on all platforms
+# SYCL excluded: _FORTIFY_SOURCE swaps memcpy for __memcpy_chk, unresolved in device code
 if(NOT MSVC AND NOT GGML_SYCL)
     add_compile_definitions(_FORTIFY_SOURCE=2)
 endif()
@@ -92,8 +91,8 @@ macro(link_ggml_backends target)
             target_link_libraries(${target} PRIVATE ggml-${backend})
         endif()
     endforeach()
-    # SYCL backend links the runtime PRIVATE, so consumers need -fsycl
-    # on their own link line to resolve libsycl.so symbols.
+
+    # SYCL links its runtime PRIVATE, consumers need -fsycl to resolve libsycl.so
     if(TARGET ggml-sycl AND GGML_SYCL)
         target_link_options(${target} PRIVATE -fsycl)
     endif()
