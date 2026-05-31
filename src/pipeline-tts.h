@@ -70,16 +70,6 @@ struct GenerationDefaults {
     int   max_new_tokens;
 };
 
-struct PromptTextProjection {
-    int                in_dim;
-    int                hid_dim;
-    int                out_dim;
-    std::vector<float> fc1_w;
-    std::vector<float> fc1_b;
-    std::vector<float> fc2_w;
-    std::vector<float> fc2_b;
-};
-
 struct PromptPrefixCacheEntry {
     std::string        key;
     int                rows;
@@ -88,7 +78,6 @@ struct PromptPrefixCacheEntry {
 
 struct PromptCache {
     bool                                initialized;
-    PromptTextProjection                text_projection;
     std::vector<float>                  tts_bos_emb;
     std::vector<float>                  tts_eos_emb;
     std::vector<float>                  tts_pad_emb;

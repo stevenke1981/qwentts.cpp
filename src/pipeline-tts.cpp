@@ -158,13 +158,6 @@ bool pipeline_tts_load(PipelineTTS * pt,
         return false;
     }
 
-    if (!prompt_cache_load(pt)) {
-        code_predictor_weights_free(&pt->code_predictor);
-        talker_weights_free(&pt->talker);
-        gf_close(&pt->gguf_talker);
-        return false;
-    }
-
     // Speaker encoder is only present in Base checkpoints. Treat absence
     // as a soft condition: voice clone path stays disabled, base-direct
     // synthesis still works.
@@ -195,6 +188,21 @@ bool pipeline_tts_load(PipelineTTS * pt,
     // headroom; the 5L code predictor uses a fraction of that.
     pt->sched = backend_sched_new(bp, 4096);
     if (!pt->sched) {
+        pipeline_codec_free(&pt->codec);
+        if (pt->has_speaker_encoder) {
+            speaker_encoder_weights_free(&pt->speaker_encoder);
+        }
+        code_predictor_weights_free(&pt->code_predictor);
+        talker_weights_free(&pt->talker);
+        gf_close(&pt->gguf_talker);
+        return false;
+    }
+
+    // Prompt cache: special embeds projected once on the backend, prefix
+    // cache primed empty. Requires the sched, so it runs after sched_new.
+    if (!prompt_cache_load(pt)) {
+        ggml_backend_sched_free(pt->sched);
+        pt->sched = NULL;
         pipeline_codec_free(&pt->codec);
         if (pt->has_speaker_encoder) {
             speaker_encoder_weights_free(&pt->speaker_encoder);
