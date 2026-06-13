@@ -57,7 +57,7 @@ extern "C" {
 // git short hash + commit date string returned by qt_version(); for
 // binding compat checks, QT_ABI_VERSION is the only number that
 // matters.
-#define QT_ABI_VERSION 2
+#define QT_ABI_VERSION 3
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -115,12 +115,19 @@ struct qt_context;
 // F32 manual chain); clamp_fp16 inserts ggml_clamp(-65504, 65504) on V
 // before attention and on the residual stream between blocks to guard
 // FP16 matmul accumulation on sub Ampere CUDA targets.
+/// backend (ABI v3) selects the GGML backend at runtime: NULL / "auto"
+/// picks ggml_backend_init_best(), otherwise a device name like "CUDA0",
+/// "Vulkan0", "Metal", or "CPU". n_gpu_layers reserves GPU layers (-1 = all
+/// layers on GPU); currently advisory, follow-up may pass it to ggml.
 struct qt_init_params {
     int          abi_version;
     const char * talker_path;
     const char * codec_path;
     bool         use_fa;
     bool         clamp_fp16;
+    // ── ABI v3 ──
+    const char * backend;         // NULL = auto
+    int          n_gpu_layers;    // -1 = all, 0 = CPU
 };
 
 // Initialise to the standard defaults: both paths NULL (caller must set
