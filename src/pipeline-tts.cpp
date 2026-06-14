@@ -14,6 +14,7 @@
 #include "prompt-builder.h"
 #include "qt-error.h"
 #include "sampling.h"
+#include "scope-guard.h"
 #include "speaker-encoder-extract.h"
 #include "talker-forward.h"
 #include "timer.h"
@@ -111,28 +112,27 @@ bool pipeline_tts_load(PipelineTTS * pt,
                        BackendPair   bp,
                        bool          use_fa,
                        bool          clamp_fp16) {
+    // Zero-initialise everything so pipeline_tts_free (called via scope_exit
+    // on any early return) only frees what has actually been allocated.
+    *pt                     = {};
     pt->bp                  = bp;
     pt->backend             = bp.backend;
-    pt->sched               = NULL;
-    pt->has_speaker_encoder = false;
+    pt->use_flash_attn      = use_fa && bp.has_gpu;
+    pt->clamp_fp16          = clamp_fp16;
 
-    // Fused flash attention needs a GPU kernel; CPU only backends fall
-    // back to the F32 manual chain automatically. clamp_fp16 is forwarded
-    // verbatim: a no op on backends that already accumulate in F32, an
-    // FP16 overflow guard on sub Ampere CUDA tensor cores.
-    pt->use_flash_attn = use_fa && bp.has_gpu;
-    pt->clamp_fp16     = clamp_fp16;
+    // RAII cleaner: runs pipeline_tts_free on any early return.
+    auto cleanup = scope_exit([pt] { pipeline_tts_free(pt); });
 
+    // ---- GGUF load & validation -------------------------------------------
     if (!gf_load(&pt->gguf_talker, talker_gguf_path)) {
         qt_log(QT_LOG_ERROR, "[Pipeline] failed to load talker GGUF: %s", talker_gguf_path);
-        return false;
+        return false;   // only gguf_talker was touched → gf_close is safe
     }
 
     const char * arch = gf_get_str(pt->gguf_talker, "general.architecture");
     if (!arch || std::strcmp(arch, "qwen3-tts") != 0) {
         qt_log(QT_LOG_ERROR, "[Pipeline] talker GGUF has wrong architecture '%s', expected 'qwen3-tts'",
                arch ? arch : "");
-        gf_close(&pt->gguf_talker);
         return false;
     }
 
@@ -147,14 +147,13 @@ bool pipeline_tts_load(PipelineTTS * pt,
     parse_speakers(pt->gguf_talker, pt->speakers);
     parse_generation_defaults(pt->gguf_talker, pt->gen_defaults);
 
+    // ---- Talker LM weights ------------------------------------------------
     if (!talker_weights_load(&pt->talker, pt->gguf_talker, pt->backend)) {
-        gf_close(&pt->gguf_talker);
         return false;
     }
 
+    // ---- Code Predictor weights -------------------------------------------
     if (!code_predictor_weights_load(&pt->code_predictor, pt->gguf_talker, pt->backend)) {
-        talker_weights_free(&pt->talker);
-        gf_close(&pt->gguf_talker);
         return false;
     }
 
@@ -163,87 +162,48 @@ bool pipeline_tts_load(PipelineTTS * pt,
     // synthesis still works.
     if (pt->model_type == "base") {
         if (!speaker_encoder_weights_load(&pt->speaker_encoder, pt->gguf_talker, pt->backend)) {
-            code_predictor_weights_free(&pt->code_predictor);
-            talker_weights_free(&pt->talker);
-            gf_close(&pt->gguf_talker);
             return false;
         }
         pt->has_speaker_encoder = (pt->speaker_encoder.weight_buf != NULL);
     }
 
+    // ---- Audio codec ------------------------------------------------------
     if (!pipeline_codec_load(&pt->codec, codec_gguf_path, bp)) {
-        if (pt->has_speaker_encoder) {
-            speaker_encoder_weights_free(&pt->speaker_encoder);
-        }
-        code_predictor_weights_free(&pt->code_predictor);
-        talker_weights_free(&pt->talker);
-        gf_close(&pt->gguf_talker);
         return false;
     }
 
-    // Scheduler shared by talker_forward_* and code_predictor_step.
-    // Routes ops the GPU backend cannot run (typical case: K-quant
-    // get_rows on CUDA) to the CPU backend. 4096 nodes covers the 28L
-    // Qwen3 talker graph (~48 ops per layer with KV cache writes) with
-    // headroom; the 5L code predictor uses a fraction of that.
+    // ---- Scheduler --------------------------------------------------------
+    // Routes ops the GPU backend cannot run (typical case: K-quant get_rows
+    // on CUDA) to the CPU backend. 4096 nodes covers the 28L Qwen3 talker
+    // graph (~48 ops per layer with KV cache writes) with headroom; the 5L
+    // code predictor uses a fraction of that.
     pt->sched = backend_sched_new(bp, 4096);
     if (!pt->sched) {
-        pipeline_codec_free(&pt->codec);
-        if (pt->has_speaker_encoder) {
-            speaker_encoder_weights_free(&pt->speaker_encoder);
-        }
-        code_predictor_weights_free(&pt->code_predictor);
-        talker_weights_free(&pt->talker);
-        gf_close(&pt->gguf_talker);
         return false;
     }
 
-    // Prompt cache: special embeds projected once on the backend, prefix
-    // cache primed empty. Requires the sched, so it runs after sched_new.
+    // ---- Prompt cache -----------------------------------------------------
+    // Special embeds projected once on the backend, prefix cache primed empty.
     if (!prompt_cache_load(pt)) {
-        ggml_backend_sched_free(pt->sched);
-        pt->sched = NULL;
-        pipeline_codec_free(&pt->codec);
-        if (pt->has_speaker_encoder) {
-            speaker_encoder_weights_free(&pt->speaker_encoder);
-        }
-        code_predictor_weights_free(&pt->code_predictor);
-        talker_weights_free(&pt->talker);
-        gf_close(&pt->gguf_talker);
         return false;
     }
 
-    // KV caches: talker holds the LM context up to 4096 positions (the
-    // longest ICL prompt observed is ~250 + max_new_tokens ~ 1500, so
-    // 4096 has 60% headroom). Predictor holds one frame of 16 sub-steps.
+    // ---- KV caches --------------------------------------------------------
+    // Talker holds the LM context up to 4096 positions (the longest ICL
+    // prompt observed is ~250 + max_new_tokens ~ 1500, so 4096 has 60%
+    // headroom). Predictor holds one frame of 16 sub-steps.
     if (!kv_cache_init(&pt->talker_kv, pt->talker.num_hidden_layers, pt->talker.num_key_value_heads,
                        pt->talker.head_dim, 4096, pt->backend)) {
-        ggml_backend_sched_free(pt->sched);
-        pt->sched = NULL;
-        pipeline_codec_free(&pt->codec);
-        if (pt->has_speaker_encoder) {
-            speaker_encoder_weights_free(&pt->speaker_encoder);
-        }
-        code_predictor_weights_free(&pt->code_predictor);
-        talker_weights_free(&pt->talker);
-        gf_close(&pt->gguf_talker);
         return false;
     }
     if (!kv_cache_init(&pt->code_predictor_kv, pt->code_predictor.num_hidden_layers,
                        pt->code_predictor.num_key_value_heads, pt->code_predictor.head_dim, pt->num_code_groups,
                        pt->backend)) {
-        kv_cache_free(&pt->talker_kv);
-        ggml_backend_sched_free(pt->sched);
-        pt->sched = NULL;
-        pipeline_codec_free(&pt->codec);
-        if (pt->has_speaker_encoder) {
-            speaker_encoder_weights_free(&pt->speaker_encoder);
-        }
-        code_predictor_weights_free(&pt->code_predictor);
-        talker_weights_free(&pt->talker);
-        gf_close(&pt->gguf_talker);
         return false;
     }
+
+    // ---- Success ----------------------------------------------------------
+    cleanup.dismiss();
 
     qt_log(QT_LOG_INFO,
            "[Pipeline] Loaded: arch=%s variant=%s tokenizer=%s codebooks=%d speaker_encoder=%s speakers=%zu fa=%s "
