@@ -6,3 +6,5 @@ tests/*/
 checkpoints/
 models/*.gguf
 __pycache__/
+
+.opencode/
