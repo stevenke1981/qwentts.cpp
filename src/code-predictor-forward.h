@@ -202,7 +202,7 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
     struct ggml_init_params gp   = { arena_bytes, NULL, true };
     struct ggml_context *   gctx = ggml_init(gp);
     if (!gctx) {
-        fprintf(stderr, "[CodePredictor] FATAL: ggml_init failed\n");
+        qt_log(QT_LOG_ERROR, "[CodePredictor] FATAL: ggml_init failed");
         return false;
     }
 
@@ -242,7 +242,7 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
 
     ggml_backend_sched_reset(sched);
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-        fprintf(stderr, "[CodePredictor] FATAL: graph allocation failed\n");
+        qt_log(QT_LOG_ERROR, "[CodePredictor] FATAL: graph allocation failed");
         ggml_backend_sched_reset(sched);
         ggml_free(gctx);
         return false;
@@ -275,7 +275,7 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
     }
 
     if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "[CodePredictor] FATAL: graph compute failed\n");
+        qt_log(QT_LOG_ERROR, "[CodePredictor] FATAL: graph compute failed");
         ggml_backend_sched_reset(sched);
         ggml_free(gctx);
         return false;
@@ -346,7 +346,7 @@ static bool code_predictor_step(const TalkerWeights *        tw,
     const int n_acoustic    = cw->num_acoustic_codebooks;
 
     if (n_acoustic + 1 > kv->max_seq_len) {
-        fprintf(stderr, "[CodePredictor] FATAL: frame width %d exceeds cache max_seq_len %d\n", n_acoustic + 1,
+        qt_log(QT_LOG_ERROR, "[CodePredictor] FATAL: frame width %d exceeds cache max_seq_len %d", n_acoustic + 1,
                 kv->max_seq_len);
         return false;
     }
@@ -370,11 +370,11 @@ static bool code_predictor_step(const TalkerWeights *        tw,
         int   cg = sample_top_k_p(logits.data(), (int) logits.size(), temperature, top_k, top_p, 1.0f, nullptr, 0, seed,
                                   subseq_base + 1, &u_g);
         if (subseq_base + 1 < 32) {
-            fprintf(stderr, "[Sample-CP] g=0 c=%d u=%.10f subseq=%lld\n", cg, (double) u_g,
+            qt_log(QT_LOG_DEBUG, "[Sample-CP] g=0 c=%d u=%.10f subseq=%lld", cg, (double) u_g,
                     (long long) (subseq_base + 1));
         }
         if (cg < 0) {
-            fprintf(stderr, "[CodePredictor] FATAL: sample returned no candidate at g=0\n");
+            qt_log(QT_LOG_ERROR, "[CodePredictor] FATAL: sample returned no candidate at g=0");
             return false;
         }
         out->codes[1] = cg;
@@ -394,11 +394,11 @@ static bool code_predictor_step(const TalkerWeights *        tw,
         int   cg = sample_top_k_p(logits.data(), (int) logits.size(), temperature, top_k, top_p, 1.0f, nullptr, 0, seed,
                                   subseq_base + 1 + g, &u_g);
         if (subseq_base + 1 + g < 32) {
-            fprintf(stderr, "[Sample-CP] g=%d c=%d u=%.10f subseq=%lld\n", g, cg, (double) u_g,
+            qt_log(QT_LOG_DEBUG, "[Sample-CP] g=%d c=%d u=%.10f subseq=%lld", g, cg, (double) u_g,
                     (long long) (subseq_base + 1 + g));
         }
         if (cg < 0) {
-            fprintf(stderr, "[CodePredictor] FATAL: sample returned no candidate at g=%d\n", g);
+            qt_log(QT_LOG_ERROR, "[CodePredictor] FATAL: sample returned no candidate at g=%d", g);
             return false;
         }
         out->codes[(size_t) (g + 1)] = cg;

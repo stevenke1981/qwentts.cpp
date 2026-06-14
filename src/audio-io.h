@@ -24,6 +24,9 @@
 // audio-resample.h: sample rate conversion
 #include "audio-resample.h"
 
+// qt-error.h: logging helpers
+#include "qt-error.h"
+
 // utf8.h: utf8_fopen, the path-UTF-8-aware fopen used below.
 #include "utf8.h"
 
@@ -32,7 +35,7 @@ static uint8_t * audio_io_load_file(const char * path, size_t * size_out) {
     *size_out = 0;
     FILE * fp = utf8_fopen(path, "rb");
     if (!fp) {
-        fprintf(stderr, "[Audio] Cannot open %s\n", path);
+        qt_log(QT_LOG_ERROR, "[Audio] Cannot open %s", path);
         return NULL;
     }
     fseek(fp, 0, SEEK_END);
@@ -112,16 +115,16 @@ static float * audio_read_mono(const char * path, int target_sr, int * T_out) {
     float * stereo_rs = raw;
     int     T_rs      = T;
     if (sr != target_sr) {
-        fprintf(stderr, "[Audio-Resample] %d Hz -> %d Hz, %d samples...\n", sr, target_sr, T);
+        qt_log(QT_LOG_INFO, "[Audio-Resample] %d Hz -> %d Hz, %d samples...", sr, target_sr, T);
         int     T_new     = 0;
         float * resampled = audio_resample(raw, T, sr, target_sr, 2, &T_new);
         free(raw);
         if (!resampled) {
-            fprintf(stderr, "[Audio-Resample] Resample failed\n");
+            qt_log(QT_LOG_ERROR, "[Audio-Resample] Resample failed");
             *T_out = 0;
             return NULL;
         }
-        fprintf(stderr, "[Audio-Resample] Done: %d -> %d samples\n", T, T_new);
+        qt_log(QT_LOG_INFO, "[Audio-Resample] Done: %d -> %d samples", T, T_new);
         stereo_rs = resampled;
         T_rs      = T_new;
     }
@@ -306,7 +309,7 @@ static std::string audio_encode_wav(const float * audio, int T_audio, int sr, Wa
         case WAV_F32:
             return audio_encode_wav_f32(audio, T_audio, sr);
     }
-    fprintf(stderr, "[WAV] unknown format %d\n", (int) fmt);
+    qt_log(QT_LOG_ERROR, "[WAV] unknown format %d", (int) fmt);
     return {};
 }
 
@@ -320,18 +323,18 @@ static bool audio_write_wav(const char * path, const float * audio, int T_audio,
 
     FILE * fp = utf8_fopen(path, "wb");
     if (!fp) {
-        fprintf(stderr, "[WAV] Cannot open %s for writing\n", path);
+        qt_log(QT_LOG_ERROR, "[WAV] Cannot open %s for writing", path);
         return false;
     }
     if (fwrite(wav.data(), 1, wav.size(), fp) != wav.size()) {
-        fprintf(stderr, "[WAV] Failed to write %s\n", path);
+        qt_log(QT_LOG_ERROR, "[WAV] Failed to write %s", path);
         fclose(fp);
         return false;
     }
     fclose(fp);
 
     const char * fmt_name = (fmt == WAV_S16) ? "S16" : (fmt == WAV_S24) ? "S24" : "F32";
-    fprintf(stderr, "[WAV] Wrote %s: %d samples, %d Hz, mono %s\n", path, T_audio, sr, fmt_name);
+    qt_log(QT_LOG_INFO, "[WAV] Wrote %s: %d samples, %d Hz, mono %s", path, T_audio, sr, fmt_name);
     return true;
 }
 
@@ -385,7 +388,7 @@ static bool wav_stream_write_header(wav_stream * ws) {
     wav_write_u32le(p, data_size);
 
     if (fwrite(header, 1, 44, ws->fp) != 44) {
-        fprintf(stderr, "[WAV-Stream] header write failed\n");
+        qt_log(QT_LOG_ERROR, "[WAV-Stream] header write failed");
         return false;
     }
     fflush(ws->fp);
@@ -408,7 +411,7 @@ static bool wav_stream_open_stdout(wav_stream * ws, int sr, WavFormat fmt) {
     }
 
     const char * fmt_name = (fmt == WAV_S16) ? "S16" : (fmt == WAV_S24) ? "S24" : "F32";
-    fprintf(stderr, "[WAV-Stream] stdout: %d Hz, mono %s\n", sr, fmt_name);
+    qt_log(QT_LOG_INFO, "[WAV-Stream] stdout: %d Hz, mono %s", sr, fmt_name);
     return true;
 }
 

@@ -4,6 +4,7 @@
 // dump.
 // File format: [int32 ndims] [int32 dim0] [int32 dim1] ... [float data...]
 
+#include "qt-error.h"
 #include "utf8.h"
 
 #include <cstdint>
@@ -37,7 +38,7 @@ static void debug_dump(const DebugDumper * d, const char * name, const float * d
     }
     FILE * f = utf8_fopen(path, "wb");
     if (!f) {
-        fprintf(stderr, "[Debug] cannot write %s\n", path);
+        qt_log(QT_LOG_ERROR, "[Debug] cannot write %s", path);
         return;
     }
     fwrite(&ndims, sizeof(int32_t), 1, f);

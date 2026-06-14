@@ -13,6 +13,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "gguf-weights.h"
+#include "qt-error.h"
 #include "weight-ctx.h"
 
 #include <cmath>
@@ -85,7 +86,7 @@ static bool tok_trans_load(QwenTokenizerTransformer * tr, const GGUFModel & gf, 
     tr->rms_norm_eps        = gf_get_f32(gf, "qwen3-tts-tokenizer.decoder.rms_norm_eps");
 
     if (tr->num_layers > TOK_TRANS_MAX_LAYERS) {
-        fprintf(stderr, "[Transformer] FATAL: %d layers exceeds compile-time max %d\n", tr->num_layers,
+        qt_log(QT_LOG_ERROR, "[Transformer] FATAL: %d layers exceeds compile-time max %d", tr->num_layers,
                 TOK_TRANS_MAX_LAYERS);
         return false;
     }
@@ -136,15 +137,15 @@ static bool tok_trans_load(QwenTokenizerTransformer * tr, const GGUFModel & gf, 
     }
 
     if (!wctx_alloc(&wctx, backend)) {
-        fprintf(stderr, "[Transformer] FATAL: backend allocation failed\n");
+        qt_log(QT_LOG_ERROR, "[Transformer] FATAL: backend allocation failed");
         return false;
     }
     tr->weight_ctx = wctx.ctx;
     tr->weight_buf = wctx.buffer;
 
-    fprintf(stderr,
+    qt_log(QT_LOG_INFO,
             "[Transformer] Loaded: %d layers, hidden %d, heads %d/%d, head_dim %d, "
-            "FFN %d, RoPE theta %.0f, sliding window %d\n",
+            "FFN %d, RoPE theta %.0f, sliding window %d",
             tr->num_layers, tr->hidden_size, tr->num_attention_heads, tr->num_kv_heads, tr->head_dim,
             tr->intermediate_size, tr->rope_theta, tr->sliding_window);
     return true;

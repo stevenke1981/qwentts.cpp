@@ -41,6 +41,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "kv-cache.h"
+#include "qt-error.h"
 #include "talker-weights.h"
 
 #include <cmath>
@@ -273,7 +274,7 @@ static bool talker_forward_core(const TalkerWeights * tw,
     };
     struct ggml_context * gctx = ggml_init(gparams);
     if (!gctx) {
-        fprintf(stderr, "[TalkerForward] FATAL: ggml_init failed\n");
+        qt_log(QT_LOG_ERROR, "[TalkerForward] FATAL: ggml_init failed");
         return false;
     }
 
@@ -332,7 +333,7 @@ static bool talker_forward_core(const TalkerWeights * tw,
 
     ggml_backend_sched_reset(sched);
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-        fprintf(stderr, "[TalkerForward] FATAL: graph allocation failed\n");
+        qt_log(QT_LOG_ERROR, "[TalkerForward] FATAL: graph allocation failed");
         ggml_backend_sched_reset(sched);
         ggml_free(gctx);
         return false;
@@ -370,7 +371,7 @@ static bool talker_forward_core(const TalkerWeights * tw,
     }
 
     if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "[TalkerForward] FATAL: graph compute failed\n");
+        qt_log(QT_LOG_ERROR, "[TalkerForward] FATAL: graph compute failed");
         ggml_backend_sched_reset(sched);
         ggml_free(gctx);
         return false;
@@ -435,7 +436,7 @@ static bool talker_forward_prefill(const TalkerWeights * tw,
                                    TalkerForwardOutput * out) {
     kv_cache_reset(kv);
     if (T > kv->max_seq_len) {
-        fprintf(stderr, "[TalkerForward] FATAL: prefill T=%d exceeds cache max_seq_len=%d\n", T, kv->max_seq_len);
+        qt_log(QT_LOG_ERROR, "[TalkerForward] FATAL: prefill T=%d exceeds cache max_seq_len=%d", T, kv->max_seq_len);
         return false;
     }
     return talker_forward_core(tw, kv, sched, input_embed, T, 0, use_flash_attn, clamp_fp16, dump_dir, out);
@@ -452,7 +453,7 @@ static bool talker_forward_decode(const TalkerWeights * tw,
                                   bool                  clamp_fp16,
                                   TalkerForwardOutput * out) {
     if (kv->cur_len + 1 > kv->max_seq_len) {
-        fprintf(stderr, "[TalkerForward] FATAL: decode would overflow cache (%d + 1 > %d)\n", kv->cur_len,
+        qt_log(QT_LOG_ERROR, "[TalkerForward] FATAL: decode would overflow cache (%d + 1 > %d)", kv->cur_len,
                 kv->max_seq_len);
         return false;
     }
