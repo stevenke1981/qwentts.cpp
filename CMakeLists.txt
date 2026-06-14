@@ -122,6 +122,7 @@ endmacro()
 # dllimport on a static archive). The shared library for ABI consumers
 # is a separate, opt-in target below.
 add_library(qwen-core STATIC
+    src/backend.cpp
     src/qwen.cpp
     src/pipeline-tts.cpp
     src/pipeline-codec.cpp
@@ -139,6 +140,7 @@ link_ggml_backends(qwen-core)
 option(QWEN_SHARED "Build the shared qwen library for ABI consumers" OFF)
 if(QWEN_SHARED)
     add_library(qwen SHARED
+        src/backend.cpp
         src/qwen.cpp
         src/pipeline-tts.cpp
         src/pipeline-codec.cpp
