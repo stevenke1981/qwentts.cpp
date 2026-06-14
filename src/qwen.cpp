@@ -22,11 +22,11 @@
 #include "qt-error.h"
 #include "version.h"
 
-#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -90,14 +90,13 @@ void qt_throw(const char * fmt, ...) {
     throw std::runtime_error(buf);
 }
 
-// Process-wide log callback. Atomic so qt_log_set can replace it without
-// locking: write happens with memory_order_release, every reader sees a
-// fully published callback pointer paired with its user_data slot.
-// std::atomic on a function pointer is lock-free on every platform we
-// target. user_data is a plain pointer because it is only ever published
-// alongside cb under the same release ordering.
-static std::atomic<qt_log_cb> g_log_cb{ nullptr };
-static void *                 g_log_cb_user = nullptr;
+// Process-wide log callback. A mutex guards both the callback pointer and
+// its user_data slot so that concurrent qt_log_set and qt_log calls on
+// different threads never see a mismatched pair. The logging path is not
+// hot, so the mutex cost is negligible.
+static std::mutex g_log_mutex;
+static qt_log_cb  g_log_cb        = nullptr;
+static void *     g_log_cb_user   = nullptr;
 
 // Routes one log line to the installed callback or to stderr. Two-pass
 // vsnprintf sizes the heap buffer when the message exceeds the stack
@@ -129,11 +128,13 @@ void qt_log(qt_log_level level, const char * fmt, ...) {
     }
     va_end(ap);
 
-    qt_log_cb cb = g_log_cb.load(std::memory_order_acquire);
-    if (cb) {
-        cb(level, buf, g_log_cb_user);
-    } else {
-        std::fprintf(stderr, "%s\n", buf);
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        if (g_log_cb) {
+            g_log_cb(level, buf, g_log_cb_user);
+        } else {
+            std::fprintf(stderr, "%s\n", buf);
+        }
     }
 }
 
@@ -179,8 +180,9 @@ void qt_audio_free(struct qt_audio * a) {
 }
 
 void qt_log_set(qt_log_cb cb, void * user_data) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    g_log_cb      = cb;
     g_log_cb_user = user_data;
-    g_log_cb.store(cb, std::memory_order_release);
 }
 
 void qt_init_default_params(struct qt_init_params * p) {
