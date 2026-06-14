@@ -197,3 +197,33 @@ target_include_directories(test-abi-c PRIVATE
 )
 target_link_libraries(test-abi-c PRIVATE qwen-core)
 link_ggml_backends(test-abi-c)
+
+# ── Unit tests (Catch2) ────────────────────────────────────────────────
+option(QWEN_TESTS "Build unit tests (requires network for Catch2 FetchContent)" OFF)
+if(QWEN_TESTS)
+    include(FetchContent)
+    FetchContent_Declare(
+        Catch2
+        GIT_REPOSITORY  https://github.com/catchorg/Catch2.git
+        GIT_TAG         v3.7.1
+        GIT_SHALLOW     TRUE
+    )
+    FetchContent_MakeAvailable(Catch2)
+
+    # Helper: register a test executable with project compile flags.
+    function(qwen_test name)
+        add_executable(${name} ${ARGN})
+        target_link_libraries(${name} PRIVATE Catch2::Catch2WithMain)
+        target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        if(MSVC)
+            target_compile_options(${name} PRIVATE /W4 /wd4100 /wd4505)
+        else()
+            target_compile_options(${name} PRIVATE -Wall -Wextra -Wshadow
+                                  -Wno-unused-parameter -Wno-unused-function)
+        endif()
+        add_test(NAME ${name} COMMAND ${name} WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+    endfunction()
+
+    # -- test-ints : int-util.h narrow / ssize correctness --------------
+    qwen_test(test-ints tests/test-ints.cpp)
+endif()
