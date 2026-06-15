@@ -22,13 +22,15 @@ find_package(Threads REQUIRED)
 # Suppress MSVC fopen/sprintf deprecation warnings, force UTF-8 source and
 # execution charsets so non-ASCII string literals (CJK language names,
 # punctuation tables in BPE and prompt builder) survive the compile
-# without a BOM. /utf-8 is restricted to C and C++ since nvcc treats a
-# bare /utf-8 as an input filename and aborts with "A single input file
-# is required". CUDA sources do not carry CJK literals so they do not
-# need this flag.
+# without a BOM. CUDA must receive /utf-8 through -Xcompiler because
+# nvcc treats a bare /utf-8 as an input filename and aborts with
+# "A single input file is required". This also prevents MSVC C4819
+# warnings when nvcc's host compiler parses UTF-8 CUDA Toolkit headers
+# under a non-UTF-8 system code page.
 if(MSVC)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
 endif()
 
 # Put executables and backend .so in the same directory (build root).
